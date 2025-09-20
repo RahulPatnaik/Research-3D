@@ -1,15 +1,50 @@
-# Python-generated files
+# Byte-compiled / optimized / DLL files
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
 build/
 dist/
 wheels/
 *.egg-info
+.eggs/
 
 # Virtual environments
-.venv
+.venv/
+.env/
+venv/
+ENV/
 
-.idea
-wandb
+# Hugging Face cache / models
+huggingface/
+hf_cache/
+.cache/
+transformers_cache/
+datasets/
+
+# Checkpoints / experiment logs
+wandb/
+mlruns/
+lightning_logs/
+*.ckpt
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE / editor configs
+.idea/
+.vscode/
 *.un~
+
+# System files
 .DS_Store
+Thumbs.db
+
+# Large model files
+*.pth
+*.pt
+*.bin
+*.safetensors
+*.exr
+*.obj
