@@ -1,0 +1,549 @@
+import copy
+import json
+import logging
+import math
+import os
+import random
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional, Any
+from collections import defaultdict, deque
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM, get_linear_schedule_with_warmup
+from datasets import load_dataset
+import wandb
+from tqdm import tqdm
+
+# Import BrickGPT components
+import sys
+sys.path.append(str(Path(__file__).parent.parent / "src"))
+from brickgpt.models import BrickGPT, BrickGPTConfig, LLM, create_instruction
+from brickgpt.data import BrickStructure, Brick, brick_library, max_brick_dimension
+from brickgpt.stability_analysis import stability_score, StabilityConfig
+
+
+@dataclass
+class GRPOConfig:
+    # Model configuration
+    model_name_or_path: str = "AvaLovelace/BrickGPT"
+    world_dim: int = 20
+    max_bricks: int = 100
+    max_brick_rejections: int = 50
+    
+    # GRPO specific parameters
+    group_size: int = 8  # Number of sequences in each group for advantage estimation
+    learning_rate: float = 1e-5
+    beta: float = 0.1  # KL penalty coefficient
+    gamma: float = 0.99  # Discount factor
+    clip_ratio: float = 0.2  # PPO clipping ratio
+    
+    # Training parameters
+    num_epochs: int = 10
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 4
+    warmup_steps: int = 100
+    save_steps: int = 500
+    eval_steps: int = 200
+    logging_steps: int = 50
+    
+    # Dataset parameters
+    dataset_name: str = "AvaLovelace/StableText2Brick"
+    max_samples: int = 1000
+    
+    # Stability analysis parameters
+    use_gurobi: bool = True
+    stability_weight: float = 1.0
+    connectivity_weight: float = 0.5
+    
+    # Action space parameters
+    max_offset_distance: int = 5  # Maximum offset from pivot brick
+    num_brick_types: int = 14  # Number of allowed brick dimensions
+    
+    # Device and logging
+    device: str = "auto"
+    use_wandb: bool = True
+    project_name: str = "brickgpt-grpo"
+    output_dir: str = "./grpo_outputs"
+
+
+class BrickDataset(Dataset):
+    """Dataset for loading brick structure data for GRPO training."""
+    
+    def __init__(self, dataset_name: str, max_samples: int = 1000):
+        self.dataset = load_dataset(dataset_name, split="train")
+        if max_samples > 0:
+            self.dataset = self.dataset.select(range(min(max_samples, len(self.dataset))))
+        
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        sample = self.dataset[idx]
+        return {
+            "caption": sample["captions"][0] if isinstance(sample["captions"], list) else sample["captions"],
+            "bricks": sample["bricks"]
+        }
+
+
+class GRPOTrainer:
+    """Group Relative Policy Optimization trainer for BrickGPT."""
+    
+    def __init__(self, config: GRPOConfig):
+        self.config = config
+        self.device = self._get_device()
+        
+        # Initialize logging
+        self._setup_logging()
+        
+        # Initialize model and tokenizer
+        self._setup_model()
+        
+        # Initialize datasets
+        self.train_dataset = BrickDataset(config.dataset_name, config.max_samples)
+        self.train_loader = DataLoader(
+            self.train_dataset, 
+            batch_size=config.batch_size, 
+            shuffle=True,
+            collate_fn=self._collate_fn
+        )
+        
+        # Initialize optimizer and scheduler
+        self._setup_optimizer()
+        
+        # Initialize stability analysis
+        self.stability_config = StabilityConfig(
+            world_dimension=(config.world_dim,) * 3,
+            print_log=False
+        )
+        
+        # Initialize action space
+        self._setup_action_space()
+        
+        # Initialize tracking
+        self.step = 0
+        self.epoch = 0
+        self.best_reward = float('-inf')
+        
+        if config.use_wandb:
+            wandb.init(
+                project=config.project_name,
+                config=config.__dict__,
+                name=f"grpo-{config.model_name_or_path.split('/')[-1]}"
+            )
+    
+    def _get_device(self):
+        if self.config.device == "auto":
+            if torch.cuda.is_available():
+                return "cuda"
+            elif torch.backends.mps.is_available():
+                return "mps"
+            else:
+                return "cpu"
+        return self.config.device
+    
+    def _setup_logging(self):
+        os.makedirs(self.config.output_dir, exist_ok=True)
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(os.path.join(self.config.output_dir, 'training.log')),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+    
+    def _setup_model(self):
+        """Initialize the BrickGPT model and tokenizer."""
+        self.tokenizer = AutoTokenizer.from_pretrained(self.config.model_name_or_path)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self.config.model_name_or_path,
+            torch_dtype=torch.float16 if self.device == "cuda" else torch.float32
+        ).to(self.device)
+        
+        # Initialize BrickGPT for stability analysis
+        brickgpt_config = BrickGPTConfig(
+            model_name_or_path=self.config.model_name_or_path,
+            world_dim=self.config.world_dim,
+            max_bricks=self.config.max_bricks,
+            max_brick_rejections=self.config.max_brick_rejections,
+            use_gurobi=self.config.use_gurobi,
+            device=self.device
+        )
+        self.brickgpt = BrickGPT(brickgpt_config)
+    
+    def _setup_optimizer(self):
+        """Initialize optimizer and learning rate scheduler."""
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.config.learning_rate,
+            weight_decay=0.01
+        )
+        
+        total_steps = len(self.train_loader) * self.config.num_epochs
+        self.scheduler = get_linear_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=self.config.warmup_steps,
+            num_training_steps=total_steps
+        )
+    
+    def _setup_action_space(self):
+        """Setup the two-step action space for brick placement."""
+        # Step 1: Choose pivot brick (index in current structure)
+        # Step 2: Choose offset from pivot brick (dx, dy, dz)
+        self.max_pivot_index = self.config.max_bricks - 1
+        self.offset_range = range(-self.config.max_offset_distance, self.config.max_offset_distance + 1)
+        self.brick_dimensions = [
+            (1, 1), (1, 2), (2, 1), (1, 4), (4, 1), (1, 6), (6, 1),
+            (1, 8), (8, 1), (2, 2), (2, 4), (4, 2), (2, 6), (6, 2)
+        ]
+    
+    def _collate_fn(self, batch):
+        """Collate function for DataLoader."""
+        captions = [item["caption"] for item in batch]
+        bricks = [item["bricks"] for item in batch]
+        return {"captions": captions, "bricks": bricks}
+    
+    def _encode_sequence(self, caption: str, bricks: str) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Encode a caption-brick sequence into input_ids and attention_mask."""
+        instruction = create_instruction(caption)
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": instruction},
+            {"role": "assistant", "content": bricks}
+        ]
+        
+        prompt = self.tokenizer.apply_chat_template(
+            messages, 
+            add_generation_prompt=False, 
+            return_tensors="pt"
+        ).squeeze(0)
+        
+        return prompt, torch.ones_like(prompt)
+    
+    def _generate_sequence_group(self, captions: List[str]) -> List[Dict[str, Any]]:
+        """Generate a group of sequences for GRPO training."""
+        group = []
+        
+        for caption in captions:
+            # Generate multiple sequences for the same caption
+            sequences = []
+            for _ in range(self.config.group_size):
+                try:
+                    # Generate brick structure using BrickGPT
+                    result = self.brickgpt(caption)
+                    bricks = result["bricks"]
+                    
+                    # Convert to text format
+                    bricks_text = bricks.to_txt() if len(bricks) > 0 else ""
+                    
+                    # Calculate reward (stability score)
+                    reward = self._calculate_reward(bricks)
+                    
+                    sequences.append({
+                        "caption": caption,
+                        "bricks": bricks,
+                        "bricks_text": bricks_text,
+                        "reward": reward,
+                        "length": len(bricks)
+                    })
+                except Exception as e:
+                    self.logger.warning(f"Failed to generate sequence: {e}")
+                    # Add empty sequence with zero reward
+                    sequences.append({
+                        "caption": caption,
+                        "bricks": BrickStructure([]),
+                        "bricks_text": "",
+                        "reward": 0.0,
+                        "length": 0
+                    })
+            
+            group.extend(sequences)
+        
+        return group
+    
+    def _calculate_reward(self, bricks: BrickStructure) -> float:
+        """Calculate reward based on stability and connectivity scores."""
+        if len(bricks) == 0:
+            return 0.0
+        
+        try:
+            # Calculate stability score using Gurobi
+            if self.config.use_gurobi and len(bricks) > 1:
+                stability_scores, _, _, _, _ = stability_score(
+                    bricks.to_json(), 
+                    brick_library, 
+                    self.stability_config
+                )
+                stability_reward = 1.0 - np.mean(stability_scores)
+            else:
+                # Fallback to connectivity-based reward
+                connectivity_scores = bricks.connectivity_scores()
+                stability_reward = 1.0 - np.mean(connectivity_scores)
+            
+            # Add length bonus to encourage longer structures
+            length_bonus = min(len(bricks) / self.config.max_bricks, 1.0) * 0.1
+            
+            # Add structure quality bonus
+            quality_bonus = 0.0
+            if not bricks.has_collisions() and not bricks.has_out_of_bounds_bricks():
+                quality_bonus = 0.2
+            
+            total_reward = (
+                self.config.stability_weight * stability_reward + 
+                length_bonus + 
+                quality_bonus
+            )
+            
+            return max(0.0, total_reward)  # Ensure non-negative rewards
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to calculate reward: {e}")
+            return 0.0
+    
+    def _compute_group_advantages(self, group: List[Dict[str, Any]]) -> List[float]:
+        """Compute group-relative advantages for GRPO."""
+        rewards = [seq["reward"] for seq in group]
+        
+        # Group sequences by caption
+        caption_groups = defaultdict(list)
+        for i, seq in enumerate(group):
+            caption_groups[seq["caption"]].append(i)
+        
+        advantages = [0.0] * len(group)
+        
+        # Compute advantages within each caption group
+        for caption, indices in caption_groups.items():
+            group_rewards = [rewards[i] for i in indices]
+            group_mean = np.mean(group_rewards)
+            group_std = np.std(group_rewards) + 1e-8
+            
+            # Normalize advantages within group
+            for i in indices:
+                advantages[i] = (rewards[i] - group_mean) / group_std
+        
+        return advantages
+    
+    def _compute_kl_divergence(self, logits: torch.Tensor, ref_logits: torch.Tensor) -> torch.Tensor:
+        """Compute KL divergence between current and reference logits."""
+        log_probs = F.log_softmax(logits, dim=-1)
+        ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+        
+        kl_div = F.kl_div(log_probs, ref_log_probs, reduction="none")
+        return kl_div.sum(dim=-1)
+    
+    def _grpo_loss(self, 
+                   logits: torch.Tensor, 
+                   advantages: torch.Tensor, 
+                   ref_logits: torch.Tensor,
+                   attention_mask: torch.Tensor) -> torch.Tensor:
+        """Compute GRPO loss with group-relative advantages."""
+        # Compute policy ratios
+        log_probs = F.log_softmax(logits, dim=-1)
+        ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+        
+        # Compute KL divergence for regularization
+        kl_div = self._compute_kl_divergence(logits, ref_logits)
+        
+        # Apply attention mask
+        masked_advantages = advantages * attention_mask.float()
+        masked_kl_div = kl_div * attention_mask.float()
+        
+        # Compute policy loss (similar to PPO but with group-relative advantages)
+        policy_loss = -masked_advantages.mean()
+        
+        # Add KL penalty
+        kl_penalty = self.config.beta * masked_kl_div.mean()
+        
+        # Add clipping (similar to PPO)
+        ratio = torch.exp(log_probs - ref_log_probs)
+        clipped_ratio = torch.clamp(ratio, 1 - self.config.clip_ratio, 1 + self.config.clip_ratio)
+        clipped_loss = -torch.min(ratio * masked_advantages, clipped_ratio * masked_advantages).mean()
+        
+        total_loss = policy_loss + kl_penalty + clipped_loss
+        
+        return total_loss
+    
+    def train_epoch(self):
+        """Train for one epoch."""
+        self.model.train()
+        total_loss = 0.0
+        total_reward = 0.0
+        num_batches = 0
+        
+        progress_bar = tqdm(self.train_loader, desc=f"Epoch {self.epoch}")
+        
+        for batch in progress_bar:
+            # Generate group of sequences
+            group = self._generate_sequence_group(batch["captions"])
+            
+            if len(group) == 0:
+                continue
+            
+            # Compute group-relative advantages
+            advantages = self._compute_group_advantages(group)
+            
+            # Prepare training data
+            input_ids_list = []
+            attention_masks = []
+            ref_logits_list = []
+            
+            for seq in group:
+                if seq["length"] == 0:
+                    continue
+                    
+                # Encode sequence
+                input_ids, attention_mask = self._encode_sequence(seq["caption"], seq["bricks_text"])
+                input_ids_list.append(input_ids)
+                attention_masks.append(attention_mask)
+                
+                # Get reference logits (from frozen model)
+                with torch.no_grad():
+                    ref_outputs = self.model(input_ids.unsqueeze(0).to(self.device))
+                    ref_logits_list.append(ref_outputs.logits.squeeze(0))
+            
+            if len(input_ids_list) == 0:
+                continue
+            
+            # Pad sequences
+            max_len = max(len(ids) for ids in input_ids_list)
+            padded_input_ids = []
+            padded_attention_masks = []
+            padded_ref_logits = []
+            
+            for i, (input_ids, attention_mask, ref_logits) in enumerate(zip(input_ids_list, attention_masks, ref_logits_list)):
+                pad_len = max_len - len(input_ids)
+                if pad_len > 0:
+                    input_ids = F.pad(input_ids, (0, pad_len), value=self.tokenizer.pad_token_id)
+                    attention_mask = F.pad(attention_mask, (0, pad_len), value=0)
+                    ref_logits = F.pad(ref_logits, (0, 0, 0, pad_len), value=0)
+                
+                padded_input_ids.append(input_ids)
+                padded_attention_masks.append(attention_mask)
+                padded_ref_logits.append(ref_logits)
+            
+            # Stack tensors
+            input_ids = torch.stack(padded_input_ids).to(self.device)
+            attention_mask = torch.stack(padded_attention_masks).to(self.device)
+            ref_logits = torch.stack(padded_ref_logits).to(self.device)
+            advantages = torch.tensor(advantages[:len(input_ids)], dtype=torch.float32).to(self.device)
+            
+            # Forward pass
+            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits
+            
+            # Compute GRPO loss
+            loss = self._grpo_loss(logits, advantages, ref_logits, attention_mask)
+            
+            # Backward pass
+            loss.backward()
+            
+            if (self.step + 1) % self.config.gradient_accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                self.optimizer.step()
+                self.scheduler.step()
+                self.optimizer.zero_grad()
+            
+            # Update metrics
+            total_loss += loss.item()
+            total_reward += np.mean([seq["reward"] for seq in group])
+            num_batches += 1
+            self.step += 1
+            
+            # Logging
+            if self.step % self.config.logging_steps == 0:
+                avg_loss = total_loss / num_batches
+                avg_reward = total_reward / num_batches
+                
+                progress_bar.set_postfix({
+                    "loss": f"{avg_loss:.4f}",
+                    "reward": f"{avg_reward:.4f}",
+                    "lr": f"{self.scheduler.get_last_lr()[0]:.2e}"
+                })
+                
+                if self.config.use_wandb:
+                    wandb.log({
+                        "train/loss": avg_loss,
+                        "train/reward": avg_reward,
+                        "train/learning_rate": self.scheduler.get_last_lr()[0],
+                        "train/step": self.step
+                    })
+            
+            # Save checkpoint
+            if self.step % self.config.save_steps == 0:
+                self.save_checkpoint()
+        
+        return total_loss / max(num_batches, 1), total_reward / max(num_batches, 1)
+    
+    def save_checkpoint(self):
+        """Save model checkpoint."""
+        checkpoint_dir = os.path.join(self.config.output_dir, f"checkpoint-{self.step}")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        
+        # Save model and tokenizer
+        self.model.save_pretrained(checkpoint_dir)
+        self.tokenizer.save_pretrained(checkpoint_dir)
+        
+        # Save training state
+        torch.save({
+            "step": self.step,
+            "epoch": self.epoch,
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
+            "best_reward": self.best_reward
+        }, os.path.join(checkpoint_dir, "training_state.pt"))
+        
+        self.logger.info(f"Checkpoint saved to {checkpoint_dir}")
+    
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load model checkpoint."""
+        self.model = AutoModelForCausalLM.from_pretrained(checkpoint_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+        
+        training_state = torch.load(os.path.join(checkpoint_path, "training_state.pt"))
+        self.step = training_state["step"]
+        self.epoch = training_state["epoch"]
+        self.optimizer.load_state_dict(training_state["optimizer_state_dict"])
+        self.scheduler.load_state_dict(training_state["scheduler_state_dict"])
+        self.best_reward = training_state["best_reward"]
+        
+        self.logger.info(f"Checkpoint loaded from {checkpoint_path}")
+    
+    def train(self):
+        """Main training loop."""
+        self.logger.info("Starting GRPO training...")
+        
+        for epoch in range(self.config.num_epochs):
+            self.epoch = epoch
+            avg_loss, avg_reward = self.train_epoch()
+            
+            self.logger.info(f"Epoch {epoch}: Loss={avg_loss:.4f}, Reward={avg_reward:.4f}")
+            
+            # Update best reward
+            if avg_reward > self.best_reward:
+                self.best_reward = avg_reward
+                self.save_checkpoint()
+        
+        self.logger.info("Training completed!")
+        
+        if self.config.use_wandb:
+            wandb.finish()
+
+
+def main():
+    """Main function to run GRPO training."""
+    config = GRPOConfig()
+    trainer = GRPOTrainer(config)
+    trainer.train()
+
+
+if __name__ == "__main__":
+    main()
