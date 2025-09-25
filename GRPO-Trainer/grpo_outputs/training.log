@@ -1,7 +1,0 @@
-2025-09-20 16:23:15,821 - INFO - Loaded model directly from AvaLovelace/BrickGPT
-2025-09-20 16:24:08,966 - INFO - Starting GRPO training...
-2025-09-20 16:24:38,533 - INFO - Set parameter WLSAccessID
-2025-09-20 16:24:38,533 - INFO - Set parameter WLSSecret
-2025-09-20 16:24:38,533 - INFO - Set parameter LicenseID to value 2707083
-2025-09-20 16:24:39,256 - INFO - Academic license 2707083 - for non-commercial use only - registered to sb___@ncsu.edu
-2025-09-20 16:39:59,860 - WARNING - Failed to generate sequence: CUDA out of memory. Tried to allocate 220.00 MiB. GPU 0 has a total capacity of 7.62 GiB of which 75.19 MiB is free. Including non-PyTorch memory, this process has 7.53 GiB memory in use. Of the allocated memory 7.33 GiB is allocated by PyTorch, and 87.35 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

@@ -48,3 +48,7 @@ Thumbs.db
 *.safetensors
 *.exr
 *.obj
+
+# Training outputs
+GRPO-Trainer/grpo_outputs/
+GRPO-Trainer/grpo_trl_outputs/
